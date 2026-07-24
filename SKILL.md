@@ -2,13 +2,13 @@
 name: fork-maintainer
 description: |
   Create OpenShift Sustaining fork patches for CVE remediation — contributor workflow.
-  Follows the official Red Hat SOP. Deterministic steps are scripted; the skill orchestrates.
+  Deterministic steps are scripted; the skill orchestrates.
   Triggers on: '/fork-maintainer'.
 ---
 
 # fork-maintainer
 
-Create a sustaining fork patch for a Go CVE. Contributor workflow only, per the Red Hat SOP.
+Create a sustaining fork patch for a Go CVE. Contributor workflow only.
 
 ## Invocation
 
@@ -26,22 +26,22 @@ Scripts live at `$HOME/.claude/skills/fork-maintainer/` (installed via `install.
 
 | Script | Input | Output |
 |--------|-------|--------|
-| `fetch.py` | `<GO-VULN-ID> <go-versions...>` | JSON: `packages` with per-version `patches` array. Each patch has `url`, `filepath` (null), `patch_applied` (false). |
+| `fetch.py` | `<GO-VULN-ID> <go-versions...>` | JSON: top-level `id` and `packages` array. Each package has `package` (module name) and `versions` array. Each version has `go`, `tag`, and `patches` array. Each patch has `url`, `filepath` (null), `patch_applied` (false). |
 | `setup.py` | `<fetch.json path>` | Creates `/tmp/fork-maintainer/<id>/`, verifies `go.mod`, downloads patch files, sets `filepath` on each version's patches, writes back into fetch.json. |
-| `patch.py` | `<fetch.json path> <tag>` | Patches a single version: creates `sustaining-<tag>` branch, or if it exists, switches to it and rebases on `upstream/sustaining-<tag>`. Applies each patch via `git am`. Skips `patch_applied: true`. Exits on failure. |
+| `patch.py` | `<fetch.json path> <tag>` | Patches a single version: creates `sustaining-<tag>` branch, or if it exists, switches to it and rebases on `upstream/sustaining-<tag>`. Applies each patch via `git am`. After each successful patch, fetches upstream tags and creates `<tag>-sec.<N>` (auto-increments). Skips `patch_applied: true`. Exits on failure. |
+| `pullrequest.py` | `<branch> <title> <description>` | Creates a PR on the upstream repo. Requires `upstream` remote. Verifies target branch exists before creating. Exits on failure. |
 
 ## Rules
 
 - When prompting the user, print the question in plain text and **end your turn**. Do not use `AskUserQuestion` unless explicitly noted.
 - No filler, no narration. Never print "Now moving to Step X" or "Proceeding to Step X" — the `━━━ TITLE ━━━` headers are the step markers. Run commands, print results, wait for input when needed, move on.
 - Never fabricate URLs, commit SHAs, or data not in script/API output.
-- If any script errors out, print the exact error output and ask the user how to proceed. Never retry or work around errors silently.
+- If any script errors out, print the exact error output. If the error is user-resolvable (missing remote, auth failure, missing dependency, wrong directory), tell the user what to fix, end turn, and wait. When the user confirms it's resolved, re-run the failed step. Never retry or work around errors silently.
 - Never run `go build`. It is not part of any step.
+- Never read, print, log, or reference secrets, tokens, API keys, or credentials. Scripts handle their own authentication — the skill must have zero awareness of sensitive values.
 - When writing JSON to fetch.json, use `jq` only. Never use `cat <<EOF`, `echo`, `python3 -c`, or the Write tool.
 
 ## Formatting
-
-All user-facing output must follow these conventions for consistency:
 
 - **Section headers:** `━━━ TITLE ━━━` (use `━` U+2501 box-drawing heavy horizontal)
 - **Success:** `✓` prefix
@@ -55,12 +55,6 @@ All user-facing output must follow these conventions for consistency:
   Module:      golang.org/x/net
   Impact:      DoS
   ```
-- **Patch action log:** `[<tag>] ✓ <action>` or `[<tag>] ✗ <action>`
-- **Command type label:** Before every bash command, prefix with the operation type:
-  - `[READ]` — queries that don't modify anything (git status, git diff, go vet, curl fetches)
-  - `[WRITE]` — modifies files (jq > file, cp, rm, echo > file)
-  - `[EXEC]` — runs scripts or applies changes (patch.py, setup.py, git am, git push)
-- **Dividers between sections:** blank line, never `---` (renders as horizontal rule and clutters)
 
 ---
 
@@ -147,6 +141,12 @@ This step runs for the **first version** before the loop starts. For subsequent 
 curl -s "https://vuln.go.dev/ID/<GO-VULN-ID>.json" -o /tmp/fork-maintainer/<GO-VULN-ID>/vuln.json
 ```
 
+Extract the CVE ID for use in later steps (report filenames, PR titles):
+
+```bash
+jq -r '.aliases[] | select(startswith("CVE-"))' /tmp/fork-maintainer/<GO-VULN-ID>/vuln.json
+```
+
 Read the patch files from the first version's `patches[].filepath` in fetch.json.
 
 ### 3b. Understand the vulnerability
@@ -173,7 +173,7 @@ Read the patch diff line by line:
 - What is the root cause the patch addresses?
 - How does the fix prevent the exploit — new validation, bounds check, type assertion, error return?
 - Read any new tests added by the patch — they show exactly how the vulnerability is triggered and how the fix prevents it
-- Identify which changes are the actual fix vs incidental (formatting, refactoring, unrelated). The SOP warns: "the commit may contain changes not strictly related to the CVE fix"
+- Identify which changes are the actual fix vs incidental (formatting, refactoring, unrelated). Note: "the commit may contain changes not strictly related to the CVE fix"
 
 ### 3e. Summarize
 
@@ -230,6 +230,7 @@ Read fetch.json. Iterate through `packages[0].versions` in order. For each versi
 - Run [Step 5 — Verify](#step-5--verify) for that tag
 - Run [Step 6 — Report](#step-6--generate-report) for that tag
 - Run [Step 7 — Push](#step-7--push) for that tag
+- Run [Step 8 — Pull Request](#step-8--pull-request) for that tag
 - Move to the next version
 
 ### Step 4 — Patch
@@ -238,57 +239,44 @@ Read fetch.json. Iterate through `packages[0].versions` in order. For each versi
 python3 $HOME/.claude/skills/fork-maintainer/patch.py /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json <tag>
 ```
 
-Parse each JSON output line and format as:
-- Success: `[<tag>] ✓ <action>`
-- Error: `[<tag>] ✗ <action>`
-
-If `patch.py` fails because `upstream` remote doesn't exist (error contains "does not appear to be a git repository" or similar), ask the user for the upstream URL and end turn. After they provide it:
-
-```bash
-git remote add upstream <user-provided-url>
+**Exit code 0:**
+```
+╔═══════════════════════════════════════════════════════╗
+║  ✓ PATCH APPLIED                                      ║
+║  Branch: sustaining-<tag>    Tag: <tag>-sec.<N>        ║
+╚═══════════════════════════════════════════════════════╝
 ```
 
-Re-run `patch.py` for the same tag.
+**Exit code 1 — error is user-resolvable:** Print the error, tell the user what to fix, end turn. After user confirms, re-run `patch.py` for the same tag.
 
-If `git am` fails, print `━━━ CONFLICT: <tag> ━━━` then:
+**Exit code 1 — `git am` conflict:** Print `━━━ CONFLICT: <tag> ━━━` then:
 
-**4a.** `git status` — show conflicted files
+1. `git status` — show conflicted files
+2. `git diff` — show conflict markers
+3. Read the failed patch hunk from `patches[].filepath`
+4. Ask: `Resolve manually, should I attempt a fix, or use a different patch?` — end turn.
 
-**4b.** `git diff` — show conflict markers
+**If user resolves manually:** wait for confirmation, then `git add <files>` and `git am --continue`.
 
-**4c.** Read the failed patch file from this version's `patches[].filepath` in fetch.json. Print the hunk that failed.
+**If user asks Claude to attempt:** read conflict markers, read patch hunk, apply fix, show result for confirmation.
 
-**4d.** Print: `Resolve manually, should I attempt a fix, or use a different patch for this version?` and end turn.
-
-If the user provides a different patch (URL or local file path) for this version:
-1. `git am --abort` to reset the failed state
-2. Remove the old patch file, download the new one to the **same filename** — do NOT re-run `setup.py`:
-   ```bash
-   PATCH_FILE=<packages[0].versions[VERSION_INDEX].patches[PATCH_INDEX].filepath>
-   rm -f "$PATCH_FILE"
-   # If URL:
-   curl -L -o "$PATCH_FILE" "<url>"
-   # If local path:
-   cp <local-path> "$PATCH_FILE"
-   ```
-   The filepath in fetch.json stays the same — no update needed. Only update `url` and reset `patch_applied`:
-   ```bash
-   jq '.packages[0].versions[<VERSION_INDEX>].patches[<PATCH_INDEX>].url = "<new-url>" | .packages[0].versions[<VERSION_INDEX>].patches[<PATCH_INDEX>].patch_applied = false' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
-   ```
-3. Re-run `patch.py` for this tag
-
-**4e.** If user resolves manually, wait for confirmation. If user asks Claude to attempt — read conflict markers, read patch hunk, apply fix, show result for confirmation.
-
-**4f.** `git add <resolved files>` then `git am --continue`
-
-**4g.** Update state:
+**If user provides a different patch:**
 ```bash
-jq '.packages[0].versions[<VERSION_INDEX>].patches[<PATCH_INDEX>].patch_applied = true' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
+git am --abort
+PATCH_FILE=<packages[0].versions[VERSION_INDEX].patches[PATCH_INDEX].filepath>
+rm -f "$PATCH_FILE"
+curl -L -o "$PATCH_FILE" "<url>"   # or: cp <local-path> "$PATCH_FILE"
+jq '.packages[0].versions[<VI>].patches[<PI>].url = "<new>" | .packages[0].versions[<VI>].patches[<PI>].patch_applied = false' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
 ```
 
-Re-run `patch.py` for the same tag to continue with remaining patches:
+**After any resolution**, re-run `patch.py` for the same tag:
 ```bash
 python3 $HOME/.claude/skills/fork-maintainer/patch.py /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json <tag>
+```
+
+If conflict was resolved manually, update state first:
+```bash
+jq '.packages[0].versions[<VI>].patches[<PI>].patch_applied = true' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
 ```
 
 ### Step 5 — Verify
@@ -402,7 +390,9 @@ First, gather and display all push details:
 
 ```bash
 REMOTE_URL=$(git remote get-url origin)
+UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null || echo "not set")
 BRANCH=$(git branch --show-current)
+TAG=$(git describe --tags --exact-match HEAD 2>/dev/null)
 AHEAD=$(git rev-list tags/<base-tag>..HEAD --count)
 ```
 
@@ -413,21 +403,115 @@ Print:
 
 ⚠  Review carefully before confirming:
 
-  Remote:     <REMOTE_URL>
-  Branch:     <BRANCH>
-  Commits:    <AHEAD> ahead of <base-tag>
+  Remote (origin):    <REMOTE_URL>
+  Remote (upstream):  <UPSTREAM_URL>
+  Branch:             <BRANCH>
+  Tag:                <TAG>
+  Commits:            <AHEAD> ahead of <base-tag>
+  Pushing to:         origin (<REMOTE_URL>)
 ```
 
 Use `AskUserQuestion`:
-- Option 1: `Yes, push branch` — description: pushes `<BRANCH>` to `<REMOTE_URL>`
+- Option 1: `Yes, push branch and tag` — description: pushes `<BRANCH>` and `<TAG>` to `<REMOTE_URL>`
 - Option 2: `No, skip push` — description: branch stays local, move to next version
 
 If confirmed:
 
 ```bash
-git push origin <BRANCH>
+git push origin <BRANCH> <TAG>
 ```
 
 Print result:
 - Success: `[<tag>] ✓ pushed to <REMOTE_URL>`
 - Failure: `[<tag>] ✗ push failed: <error>` — end turn and ask user how to proceed.
+
+### Step 8 — Pull Request
+
+**8a.** Construct the PR title. The Go version is the `go` directive from the tag's go.mod, not the user's requested version:
+
+```
+[Go <go-directive>, sustaining-<tag>] <CVE-ID>: <commit subject from patch>
+```
+
+Get the commit subject:
+```bash
+git log -1 --format=%s
+```
+
+Get the CVE ID:
+```bash
+jq -r '.aliases[] | select(startswith("CVE-"))' /tmp/fork-maintainer/<GO-VULN-ID>/vuln.json
+```
+
+**8b.** Construct the PR description. Use the exact commands and values from this session:
+
+````
+## Process
+
+```bash
+git switch -c sustaining-<tag> tags/<tag>
+git am <patch filepath>
+# <for each patch file applied, list the exact git am command>
+```
+
+## Conflicts
+
+<if none: "No conflicts — patch applied cleanly.">
+<if conflicts occurred, for each file:>
+- `<filename>`: <what the conflict was and how it was resolved>
+
+## Patch Source
+
+<for each patch:>
+- <patches[].url>
+
+## Verification
+
+- `go vet ./...`: <passed/failed>
+- Runtime gates: <none or gate=value>
+
+## Tag
+
+`<tag>-sec.<N>`
+````
+
+**8c.** Print the PR details for user review:
+
+```
+━━━ PULL REQUEST: <tag> ━━━
+
+| Field           | Value                              |
+|-----------------|------------------------------------|
+| Title           | <constructed title>                |
+| Upstream repo   | <org/repo from upstream remote>    |
+| Local repo      | <org/repo from origin remote>      |
+| Target branch   | sustaining-<tag>                   |
+| Head branch     | <username>:sustaining-<tag>        |
+
+Description:
+<print the full PR description constructed in 8b>
+```
+
+Then use `AskUserQuestion`:
+- Option 1: `Yes, create PR` — creates the PR
+- Option 2: `No, skip PR` — move to next version
+
+**8d.** If confirmed, run:
+
+```bash
+python3 $HOME/.claude/skills/fork-maintainer/pullrequest.py "sustaining-<tag>" "<title>" "<description>"
+```
+
+Parse the JSON output. On success, `pullrequest.py` returns `{"info": "<PR URL>"}`. Print using Unicode box-drawing characters. Measure the URL length first and size the box to fit — the URL must not truncate or overflow:
+
+```
+╔═══════════════════════════════════════════════════════════════════╗
+║  ✓ PR CREATED                                                     ║
+║                                                                   ║
+║  https://github.com/openshift-sustaining/<repo>/pull/<number>       ║
+╚═══════════════════════════════════════════════════════════════════╝
+```
+
+The URL line must be a clickable markdown link: `[<URL>](<URL>)` placed inside the box. Pad the box width to the URL length + 4 characters of margin.
+
+On failure: `✗ PR failed: <error>` — end turn and ask user how to proceed.
