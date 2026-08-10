@@ -28,7 +28,8 @@ Scripts live at `$HOME/.claude/skills/fork-maintainer/` (installed via `install.
 |--------|-------|--------|
 | `fetch.py` | `<GO-VULN-ID> <go-versions...>` | JSON: top-level `id` and `packages` array. Each package has `package` (module name) and `versions` array. Each version has `go`, `tag`, and `patches` array. Each patch has `url`, `filepath` (null), `patch_applied` (false). |
 | `setup.py` | `<fetch.json path>` | Creates `/tmp/fork-maintainer/<id>/`, verifies `go.mod`, downloads patch files, sets `filepath` on each version's patches, writes back into fetch.json. |
-| `patch.py` | `<fetch.json path> <tag>` | Patches a single version: creates `sustaining-<tag>` branch, or if it exists, switches to it and rebases on `upstream/sustaining-<tag>`. Applies each patch via `git am`. After each successful patch, fetches upstream tags and creates `<tag>-sec.<N>` (auto-increments). Skips `patch_applied: true`. Exits on failure. |
+| `branch_setup.py` | `<fetch.json path> <tag>` | Checks upstream remote, fetches upstream. If `upstream/sustaining-<tag>` exists, switches to it and rebases. Otherwise creates from `tags/<tag>`. Exits on failure. |
+| `patch.py` | `<fetch.json path> <tag>` | Applies patches only — assumes already on the correct branch. Skips `patch_applied: true`. Updates fetch.json after each successful patch. Exits on failure. Re-runnable after conflict resolution. |
 | `pullrequest.py` | `<branch> <title> <description>` | Creates a PR on the upstream repo. Requires `upstream` remote. Verifies target branch exists before creating. Exits on failure. |
 
 ## Rules
@@ -103,7 +104,7 @@ If the user provides a local file path instead of a URL, resolve it to an absolu
 realpath <user-provided-path>
 ```
 
-Then set `url` to `""` and `filepath` to the resolved absolute path. This tells `setup.py` to skip downloading that patch (filepath is already set).
+Then set `url` to `""` and `filepath` to the resolved absolute path. Note: `setup.py` will skip patches where `filepath` is already set and `url` is empty.
 
 Print the updated table and re-ask. Only this one question until "Yes, proceed".
 
@@ -198,12 +199,11 @@ This context is carried forward to Steps 4 and 5.
 
 ---
 
-## Steps 4 & 5 — Patch and verify each version
+## Per-version loop
 
-Read fetch.json. Iterate through `packages[0].versions` in order. For each version where any `patches[].patch_applied` is `false`:
+Read fetch.json. Iterate through `packages[0].versions` in order. For each version:
 
-1. Get the `tag` and `go` version from that entry
-2. Print:
+1. Print:
    ```
    ━━━ PATCHING <tag> (Go <go>) ━━━
 
@@ -211,8 +211,7 @@ Read fetch.json. Iterate through `packages[0].versions` in order. For each versi
    |----------------------------|---------------------------|
    | <url>                      | <filepath>                |
    ```
-3. For the **second version onward**, print the status table and patches before asking:
-
+2. For the **second version onward**, print the progress table:
    ```
    ━━━ PROGRESS ━━━
 
@@ -225,15 +224,32 @@ Read fetch.json. Iterate through `packages[0].versions` in order. For each versi
    Then use `AskUserQuestion`:
    - Option 1: `Yes, proceed` — use these patches
    - Option 2: `No, use different patches` — user provides alternatives
-   The first version was already confirmed in Step 1 — proceed directly.
-- Run [Step 4 — Patch](#step-4--patch) for that tag
-- Run [Step 5 — Verify](#step-5--verify) for that tag
-- Run [Step 6 — Report](#step-6--generate-report) for that tag
-- Run [Step 7 — Push](#step-7--push) for that tag
-- Run [Step 8 — Pull Request](#step-8--pull-request) for that tag
-- Move to the next version
 
-### Step 4 — Patch
+   The first version was already confirmed in Step 1 — proceed directly.
+
+3. Run steps in order:
+   - Step 4 — Branch setup + Patch
+   - Step 5 — Verify
+   - Step 6 — Report
+   - Step 7 — Push
+   - Step 8 — Pull Request
+4. Move to the next version
+
+---
+
+## Step 4 — Branch setup and patch
+
+### 4a. Branch setup
+
+Run once per version. Do NOT re-run after conflict resolution.
+
+```bash
+python3 $HOME/.claude/skills/fork-maintainer/branch_setup.py /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json <tag>
+```
+
+On failure, print the error and tell the user what to fix. After user confirms, re-run.
+
+### 4b. Apply patches
 
 ```bash
 python3 $HOME/.claude/skills/fork-maintainer/patch.py /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json <tag>
@@ -243,41 +259,63 @@ python3 $HOME/.claude/skills/fork-maintainer/patch.py /tmp/fork-maintainer/<GO-V
 ```
 ╔═══════════════════════════════════════════════════════╗
 ║  ✓ PATCH APPLIED                                      ║
-║  Branch: sustaining-<tag>    Tag: <tag>-sec.<N>        ║
+║  Branch: sustaining-<tag>                              ║
 ╚═══════════════════════════════════════════════════════╝
 ```
+Proceed to Step 5.
 
-**Exit code 1 — error is user-resolvable:** Print the error, tell the user what to fix, end turn. After user confirms, re-run `patch.py` for the same tag.
+**Exit code 1:** Go to conflict resolution below.
 
-**Exit code 1 — `git am` conflict:** Print `━━━ CONFLICT: <tag> ━━━` then:
+---
 
-1. `git status` — show conflicted files
-2. `git diff` — show conflict markers
-3. Read the failed patch hunk from `patches[].filepath`
-4. Ask: `Resolve manually, should I attempt a fix, or use a different patch?` — end turn.
+### Conflict resolution
 
-**If user resolves manually:** wait for confirmation, then `git add <files>` and `git am --continue`.
+When `patch.py` fails, print `━━━ CONFLICT: <tag> ━━━` then show the raw outputs:
 
-**If user asks Claude to attempt:** read conflict markers, read patch hunk, apply fix, show result for confirmation.
+1. Print the error JSON from `patch.py` — this contains the `git am` stderr
+2. `git status` — print full output
+3. `git diff` — print full output showing conflict markers
+4. `git am --show-current-patch=diff` — print full output showing what the patch tried to apply
 
-**If user provides a different patch:**
-```bash
-git am --abort
-PATCH_FILE=<packages[0].versions[VERSION_INDEX].patches[PATCH_INDEX].filepath>
-rm -f "$PATCH_FILE"
-curl -L -o "$PATCH_FILE" "<url>"   # or: cp <local-path> "$PATCH_FILE"
-jq '.packages[0].versions[<VI>].patches[<PI>].url = "<new>" | .packages[0].versions[<VI>].patches[<PI>].patch_applied = false' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
-```
+Then use `AskUserQuestion`:
+- Option 1: `Resolve manually`
+- Option 2: `Attempt a fix`
+- Option 3: `Use a different patch`
 
-**After any resolution**, re-run `patch.py` for the same tag:
-```bash
-python3 $HOME/.claude/skills/fork-maintainer/patch.py /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json <tag>
-```
+#### Resolve manually
 
-If conflict was resolved manually, update state first:
+User resolves the conflict on their own — they will run `git add`, `git am --continue`, or apply the patch their way. When user confirms done, update state and proceed to Step 5:
 ```bash
 jq '.packages[0].versions[<VI>].patches[<PI>].patch_applied = true' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
 ```
+
+#### Attempt a fix
+
+1. Read the conflicted file — look for `<<<<<<<`, `=======`, `>>>>>>>` markers
+2. Read the patch hunk from `git am --show-current-patch=diff` — understand what the patch intended to change
+3. Using the CVE understanding from Step 3, determine the correct resolution that preserves the fix intent
+4. Edit the conflicted file to resolve — remove conflict markers, apply the intended change
+5. Show the resolved file to the user for confirmation before proceeding
+6. After user confirms: `git add <resolved files>` then `git am --continue`
+7. Update state and proceed to Step 5:
+```bash
+jq '.packages[0].versions[<VI>].patches[<PI>].patch_applied = true' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
+```
+
+#### Use a different patch
+
+1. `git am --abort` — reset the failed state
+2. Remove the old patch and download the replacement to the same filename:
+   ```bash
+   PATCH_FILE=<packages[0].versions[VERSION_INDEX].patches[PATCH_INDEX].filepath>
+   rm -f "$PATCH_FILE"
+   curl -L -o "$PATCH_FILE" "<url>"   # or: cp <local-path> "$PATCH_FILE"
+   ```
+3. Update fetch.json:
+   ```bash
+   jq '.packages[0].versions[<VI>].patches[<PI>].url = "<new>" | .packages[0].versions[<VI>].patches[<PI>].patch_applied = false' /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json > /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp && mv /tmp/fork-maintainer/<GO-VULN-ID>/fetch.tmp /tmp/fork-maintainer/<GO-VULN-ID>/fetch.json
+   ```
+4. Re-run `patch.py` for this tag (do NOT re-run `branch_setup.py`)
 
 ### Step 5 — Verify
 
@@ -298,18 +336,9 @@ GOTOOLCHAIN=go<go-directive> go vet ./...
 Print full output. Confirms imports, references, types are valid at the target Go version.
 
 **5c. Runtime gates:**
-If Step 3 identified conditional logic, run code to check the actual value:
+If Step 3 identified conditional logic, write a small Go file to `/tmp/fork-maintainer/<GO-VULN-ID>/check_gate.go` using the Write tool that prints the gate value, then run:
 ```bash
-cd /tmp/fork-maintainer/<GO-VULN-ID>
-cat > check_gate.go << 'EOF'
-package main
-import "fmt"
-// import what's needed to evaluate the gate
-func main() {
-    // print the gate value
-}
-EOF
-GOTOOLCHAIN=go<go-directive> go run check_gate.go
+GOTOOLCHAIN=go<go-directive> go run /tmp/fork-maintainer/<GO-VULN-ID>/check_gate.go
 ```
 Print output. If the gate makes the fix inactive, use `AskUserQuestion` with:
 - Option 1: `Use a different patch for this version` — user provides an alternative that doesn't have the gate
@@ -392,7 +421,6 @@ First, gather and display all push details:
 REMOTE_URL=$(git remote get-url origin)
 UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null || echo "not set")
 BRANCH=$(git branch --show-current)
-TAG=$(git describe --tags --exact-match HEAD 2>/dev/null)
 AHEAD=$(git rev-list tags/<base-tag>..HEAD --count)
 ```
 
@@ -406,19 +434,18 @@ Print:
   Remote (origin):    <REMOTE_URL>
   Remote (upstream):  <UPSTREAM_URL>
   Branch:             <BRANCH>
-  Tag:                <TAG>
   Commits:            <AHEAD> ahead of <base-tag>
   Pushing to:         origin (<REMOTE_URL>)
 ```
 
 Use `AskUserQuestion`:
-- Option 1: `Yes, push branch and tag` — description: pushes `<BRANCH>` and `<TAG>` to `<REMOTE_URL>`
+- Option 1: `Yes, push branch` — description: pushes `<BRANCH>` to `<REMOTE_URL>`
 - Option 2: `No, skip push` — description: branch stays local, move to next version
 
 If confirmed:
 
 ```bash
-git push origin <BRANCH> <TAG>
+git push origin <BRANCH>
 ```
 
 Print result:
@@ -430,7 +457,7 @@ Print result:
 **8a.** Construct the PR title. The Go version is the `go` directive from the tag's go.mod, not the user's requested version:
 
 ```
-[Go <go-directive>, sustaining-<tag>] <CVE-ID>: <commit subject from patch>
+[Go <go-directive>] <CVE-ID>: <commit subject from patch>
 ```
 
 Get the commit subject:
@@ -443,22 +470,27 @@ Get the CVE ID:
 jq -r '.aliases[] | select(startswith("CVE-"))' /tmp/fork-maintainer/<GO-VULN-ID>/vuln.json
 ```
 
-**8b.** Construct the PR description. Use the exact commands and values from this session:
+**8b.** Construct the PR description. List the exact git commands that produced the current state — not what scripts were run, but the underlying git operations. Use actual values from this session:
 
 ````
 ## Process
 
 ```bash
-git switch -c sustaining-<tag> tags/<tag>
-git am <patch filepath>
-# <for each patch file applied, list the exact git am command>
+git fetch upstream
+git switch -c sustaining-<tag> <source>   # or: git switch sustaining-<tag> + git rebase upstream/sustaining-<tag>
+git am <patch-filepath-1>
+git am <patch-filepath-2>                 # if multiple patches
 ```
 
 ## Conflicts
 
 <if none: "No conflicts — patch applied cleanly.">
 <if conflicts occurred, for each file:>
-- `<filename>`: <what the conflict was and how it was resolved>
+- `<filename>`: <description of conflict and resolution>
+  ```bash
+  git add <filename>
+  git am --continue
+  ```
 
 ## Patch Source
 
@@ -467,12 +499,11 @@ git am <patch filepath>
 
 ## Verification
 
-- `go vet ./...`: <passed/failed>
+```bash
+GOTOOLCHAIN=go<go-directive> go vet ./...   # <passed/failed>
+```
 - Runtime gates: <none or gate=value>
 
-## Tag
-
-`<tag>-sec.<N>`
 ````
 
 **8c.** Print the PR details for user review:
