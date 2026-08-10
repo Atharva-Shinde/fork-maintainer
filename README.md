@@ -52,7 +52,7 @@ Given a Go vulnerability ID and target Go versions, the skill:
 4. Applies patches to sustaining branches (`sustaining-<tag>`)
 5. Verifies backport completeness, compatibility, and runtime gates
 6. Generates per-version reports
-7. Pushes branches and tags to the user's fork
+7. Pushes branches to the user's fork
 8. Creates PRs on the upstream sustaining repo
 
 ## How it works
@@ -62,8 +62,9 @@ The skill combines deterministic scripts with AI orchestration:
 | Script | Purpose |
 |--------|---------|
 | `fetch.py` | Queries the Go vulnerability database and module proxy to find compatible tags |
-| `setup.py` | Verifies the environment and downloads patch files |
-| `patch.py` | Creates branches, applies patches via `git am`, creates version tags |
+| `setup.py` | Verifies go.mod and downloads patch files |
+| `branch_setup.py` | Creates or switches to `sustaining-<tag>` branch, syncs with upstream |
+| `patch.py` | Applies patches via `git am`, re-runnable after conflict resolution |
 | `pullrequest.py` | Creates PRs on the upstream sustaining repo |
 
 The skill (SKILL.md) orchestrates these scripts, handles conflicts with AI-assisted resolution, verifies backports, and manages user interaction.
@@ -72,11 +73,12 @@ The skill (SKILL.md) orchestrates these scripts, handles conflicts with AI-assis
 
 ```
 fork-maintainer/
-├── fetch.py          # CVE lookup + version selection
-├── setup.py          # Environment check + patch download
-├── patch.py          # Branch creation + patch application + tagging
-├── pullrequest.py    # PR creation on upstream repo
-├── SKILL.md          # Skill definition (Claude Code reads this)
-├── install.sh        # Copies files to ~/.claude/skills/fork-maintainer/
+├── fetch.py            # CVE lookup + version selection
+├── setup.py            # Environment check + patch download
+├── branch_setup.py     # Branch creation + upstream sync
+├── patch.py            # Patch application (re-runnable)
+├── pullrequest.py      # PR creation on upstream repo
+├── SKILL.md            # Skill definition (Claude Code reads this)
+├── install.sh          # Copies files to ~/.claude/skills/fork-maintainer/
 └── README.md
 ```
