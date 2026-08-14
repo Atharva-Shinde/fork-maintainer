@@ -28,7 +28,7 @@ Scripts live at `$HOME/.claude/skills/fork-maintainer/` (installed via `install.
 |--------|-------|--------|
 | `fetch.py` | `<GO-VULN-ID> <go-versions...>` | JSON: top-level `id` and `packages` array. Each package has `package` (module name) and `versions` array. Each version has `go`, `tag`, and `patches` array. Each patch has `url`, `filepath` (null), `patch_applied` (false). |
 | `setup.py` | `<fetch.json path>` | Creates `/tmp/fork-maintainer/<id>/`, verifies `go.mod`, downloads patch files, sets `filepath` on each version's patches, writes back into fetch.json. |
-| `branch_setup.py` | `<fetch.json path> <tag>` | Checks upstream remote, fetches upstream. If `upstream/sustaining-<tag>` exists, switches to it and rebases. Otherwise creates from `tags/<tag>`. Exits on failure. |
+| `branch_setup.py` | `<fetch.json path> <tag>` | Checks upstream remote, fetches upstream. If `sustaining-<tag>` exists locally, switches to it and rebases on upstream if available. If only `upstream/sustaining-<tag>` exists, creates local branch from it. Exits on failure if neither exists. |
 | `patch.py` | `<fetch.json path> <tag>` | Applies patches only — assumes already on the correct branch. Skips `patch_applied: true`. Updates fetch.json after each successful patch. Exits on failure. Re-runnable after conflict resolution. |
 | `pullrequest.py` | `<branch> <title> <description>` | Creates a PR on the upstream repo. Requires `upstream` remote. Verifies target branch exists before creating. Exits on failure. |
 
