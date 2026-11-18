@@ -4,8 +4,8 @@
 The catalog covers language features, public API additions, deprecations, API
 removal candidates, and documented behavior changes. It compares tagged Go API
 inventories and parses the official release-note Markdown from golang/website.
-Relevant implementation commits and test files are attached when they can be
-identified. Arbitrary commits and maintenance-branch history are not classified.
+Related implementation commits and test files are attached only when linked by
+an issue ID. Maintenance-branch commits are excluded.
 
 Requires Python 3 and git. The Go checkout needs the previous and target release
 tags. Release notes are read from a website checkout when supplied, otherwise
@@ -35,14 +35,16 @@ PARSER_TYPECHECK_PATHS = (
 )
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
+HEADING_ID_RE = re.compile(r"\s*\{#[^}]+\}\s*$")
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.*)$")
 
-# Explicit observable-change language only; avoid treating new APIs or speedups
-# as behavior changes merely because a note says "now" or "new".
+# These signals describe observable behavior, rather than API additions or
+# implementation/performance improvements.
 BEHAVIOR_SIGNALS = re.compile(
     r"\b(no longer|previously|instead of|now returns?|now requires?|"
     r"now behaves?|behavior has changed|behaviour has changed|"
     r"behavior change|behaviour change|will now|used to|is now required|"
-    r"has been removed|is no longer available)\b", re.IGNORECASE,
+    r"has been removed|is no longer available|must now)\b", re.IGNORECASE,
 )
 DEPRECATION_RE = re.compile(
     r"\b(deprecat\w*|discouraged|should not be used)\b", re.IGNORECASE
@@ -100,24 +102,41 @@ def extract_issue_numbers(text: str) -> list[str]:
 
 
 def markdown_text(text: str) -> str:
-    """Remove Markdown/HTML presentation while preserving readable wording."""
+    """Strip Markdown decoration without changing underscores in code/symbols."""
     text = HTML_COMMENT_RE.sub(" ", text)
+    code: list[str] = []
+
+    def preserve_code(match: re.Match[str]) -> str:
+        code.append(match.group(2))
+        return f"\x00CODE{len(code) - 1}\x00"
+
+    text = re.sub(r"(`+)(.*?)\1", preserve_code, text, flags=re.DOTALL)
     text = MARKDOWN_LINK_RE.sub(r"\1", text)
-    text = re.sub(r"`+", "", text)
-    text = re.sub(r"</?\w+[^>]*>", " ", text)
-    text = re.sub(r"[*_~]", "", text)
-    return " ".join(text.split()).strip()
+    text = re.sub(r"</?(?:code|em|strong|span|a)\b[^>]*>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"(?<!\w)(\*\*|__)(.+?)\1(?!\w)", r"\2", text)
+    text = re.sub(r"(?<!\w)(\*|_)(.+?)\1(?!\w)", r"\2", text)
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    text = re.sub(r"\\([\\`*_{}\[\]()#+.!-])", r"\1", text)
+    text = " ".join(text.split()).strip()
+    for index, value in enumerate(code):
+        text = text.replace(f"\x00CODE{index}\x00", value)
+    return text
+
+
+def _note_issue_ids(raw: str) -> set[str]:
+    """Extract issue links, ignoring rollback/revert bookkeeping comments."""
+    issues: set[str] = set()
+    for comment in HTML_COMMENT_RE.findall(raw):
+        if re.search(r"\b(rolled back|reverted|rollback|revert)\b", comment, re.I):
+            continue
+        issues.update(extract_issue_numbers(comment))
+    return issues
 
 
 def parse_release_markdown(content: str) -> list[dict[str, Any]]:
-    """Parse official release-note Markdown, retaining headings, links/issues.
-
-    Go release notes are maintained in golang/website as Markdown, not in the
-    golang/go source tree. Issue links often live in HTML comments immediately
-    before a paragraph or list item, so carry those IDs onto the next text block.
-    """
+    """Parse release-note Markdown into paragraph/list-item sized blocks."""
     lines = content.splitlines()
-    # Skip YAML front matter; its title/path are metadata, not article content.
     if lines and lines[0].strip() == "---":
         closing = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
         if closing is not None:
@@ -126,65 +145,70 @@ def parse_release_markdown(content: str) -> list[dict[str, Any]]:
     heading = ""
     article_started = False
     sections: list[dict[str, Any]] = []
-    paragraph: list[str] = []
+    block: list[str] = []
     pending_issues: set[str] = set()
 
     def flush() -> None:
         nonlocal pending_issues
-        raw = "\n".join(paragraph).strip()
-        paragraph.clear()
+        raw = "\n".join(block).strip()
+        block.clear()
         if not raw:
             return
 
-        # Comments contain issue references and sometimes CL references. Strip
-        # them from display text but retain the issue links as evidence.
-        comment_issues = set()
-        for comment in HTML_COMMENT_RE.findall(raw):
-            comment_issues.update(extract_issue_numbers(comment))
+        issue_ids = _note_issue_ids(raw) | pending_issues
         body = HTML_COMMENT_RE.sub(" ", raw)
         text = markdown_text(body)
         if not text:
-            pending_issues.update(comment_issues)
+            pending_issues.update(issue_ids)
             return
 
-        links = list(dict.fromkeys(MARKDOWN_LINK_RE.findall(body)))
-        # Store URLs, not link label/URL tuples, while retaining issue IDs from
-        # both visible prose and source comments.
-        link_urls = [url for _, url in links]
-        issues = pending_issues | comment_issues
-        issues.update(extract_issue_numbers(raw + " " + " ".join(link_urls)))
+        # A leading list marker is formatting, not part of the change summary.
+        text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", text)
+        links = [url for _, url in MARKDOWN_LINK_RE.findall(body)]
+        issue_ids.update(extract_issue_numbers(" ".join(links)))
         if article_started and heading:
             sections.append({
                 "heading": heading,
                 "text": text,
-                "links": link_urls,
-                "issue_numbers": sorted(issues),
+                "links": list(dict.fromkeys(links)),
+                "issue_numbers": sorted(issue_ids),
             })
-        pending_issues = set()
+        pending_issues.clear()
 
     for line in lines:
         stripped = line.strip()
-        heading_match = re.match(r"^#{1,6}\s+(.+?)\s*#\{[^}]+\}\s*$", stripped)
-        if not heading_match:
-            heading_match = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
+        heading_match = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
         if heading_match:
             flush()
-            heading = markdown_text(heading_match.group(1))
+            heading = HEADING_ID_RE.sub("", heading_match.group(1)).strip()
+            heading = markdown_text(heading)
             if re.search(r"\bGo\s*1\.\d+\b", heading, re.I):
                 article_started = True
             continue
-
         if not article_started:
             continue
-        # An issue-only comment can be separated from its note by blank lines.
+
         comment_only = HTML_COMMENT_RE.fullmatch(stripped)
         if comment_only:
-            pending_issues.update(extract_issue_numbers(comment_only.group(1)))
+            comment = comment_only.group(1)
+            if not re.search(r"\b(rolled back|reverted|rollback|revert)\b", comment, re.I):
+                pending_issues.update(extract_issue_numbers(comment))
+            # Keep the comment with an open text/list item so item-local issue
+            # references stay attached to that item, not the next paragraph.
+            if block:
+                block.append(stripped)
+            continue
+
+        list_match = LIST_ITEM_RE.match(line)
+        if list_match:
+            flush()
+            block.append(list_match.group(1))
             continue
         if not stripped:
             flush()
         else:
-            paragraph.append(stripped)
+            # Indented continuation lines remain part of the current list item.
+            block.append(stripped)
     flush()
     return sections
 
@@ -193,26 +217,17 @@ def get_release_notes(repo: Path, tag: str, version: str,
                       website_repo: Path | None, website_ref: str) -> dict[str, Any]:
     """Load canonical notes from golang/website, where Go keeps release docs."""
     version_file = f"go{version}.md"
-
-    # A local website checkout is deterministic and avoids a network request.
     if website_repo is not None:
         path = f"_content/doc/{version_file}"
         content = git_file(website_repo, website_ref, path)
         if content:
             sections = parse_release_markdown(content)
             if sections:
-                return {
-                    "source": "golang/website",
-                    "path": path,
-                    "ref": website_ref,
-                    "url": f"https://github.com/golang/website/blob/{website_ref}/{path}",
-                    "sections": sections,
-                }
+                return {"source": "golang/website", "path": path, "ref": website_ref,
+                        "url": f"https://github.com/golang/website/blob/{website_ref}/{path}",
+                        "sections": sections}
             raise RuntimeError(f"release-note file {path} at {website_ref} contained no article sections")
 
-    # Check the Go checkout only for a local copy. The official notes were moved
-    # out of golang/go to golang/website (golang/go#58645), so absence here is
-    # expected rather than evidence that the version has no release notes.
     for path in (f"_content/doc/{version_file}", f"doc/{version_file}"):
         content = git_file(repo, tag, path)
         if content:
@@ -222,12 +237,10 @@ def get_release_notes(repo: Path, tag: str, version: str,
                         "url": f"https://github.com/golang/go/blob/{tag}/{path}",
                         "sections": sections}
 
-    # The canonical source is raw Markdown, not the rendered go.dev HTML page.
-    # The latter includes site navigation and has a different DOM structure.
     raw_url = f"https://raw.githubusercontent.com/golang/website/{website_ref}/_content/doc/{version_file}"
     source_url = f"https://github.com/golang/website/blob/{website_ref}/_content/doc/{version_file}"
     try:
-        request = Request(raw_url, headers={"User-Agent": "go-release-change-extractor/2.0"})
+        request = Request(raw_url, headers={"User-Agent": "go-release-change-extractor/3.0"})
         with urlopen(request, timeout=30) as response:
             content = response.read().decode("utf-8", errors="replace")
     except (OSError, URLError) as exc:
@@ -235,7 +248,6 @@ def get_release_notes(repo: Path, tag: str, version: str,
             f"cannot fetch official Go {version} release notes from {raw_url}: {exc}. "
             "Use --website-repo with a local golang/website checkout or check network access."
         ) from exc
-
     sections = parse_release_markdown(content)
     if not sections:
         raise RuntimeError(f"official release-note Markdown at {source_url} parsed to zero sections")
@@ -332,7 +344,6 @@ def api_change_records(repo: Path, base_tag: str, release_tag: str,
     changes = grouped_api_records(additions, "public_api_addition", new_url)
     changes.extend(grouped_api_records(deprecated, "deprecation", new_url))
 
-    # Go's explicit compatibility exceptions are not API removals.
     exceptions = except_entries(repo, release_tag)
     removals = (old_api - new_api) - exceptions
     changes.extend(grouped_api_records(removals, "api_removal_candidate", old_url, "review_required"))
@@ -348,19 +359,25 @@ def api_change_records(repo: Path, base_tag: str, release_tag: str,
 
 def commit_records(repo: Path, base_tag: str, release_tag: str,
                    paths: tuple[str, ...]) -> list[dict[str, Any]]:
-    """Collect commit metadata and changed/test files for source paths."""
-    raw = run_git(repo, "log", "--format=%H%x1f%s%x1f%b",
+    """Collect commits but exclude commits explicitly backported to maintenance."""
+    raw = run_git(repo, "log", "--format=%H%x1f%s%x1f%b%x1e",
                   f"{base_tag}..{release_tag}", "--", *paths)
     records = []
-    for row in raw.split("\n\n"):
-        fields = row.split("\x1f", 2)
+    for row in raw.split("\x1e"):
+        fields = row.strip("\n").split("\x1f", 2)
         if len(fields) != 3:
             continue
         sha, subject, body = fields
         sha = sha.strip()
+        subject = subject.strip()
+        # Maintenance backports can be ancestors of a later release tag. The
+        # explicit subject prefix is Go's marker; do not attach them as release
+        # implementation evidence.
+        if re.match(r"^\[release-branch\.[^]]+\]", subject, re.I):
+            continue
         files = run_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines()
         records.append({
-            "commit": sha, "subject": subject.strip(), "body": body.strip(),
+            "commit": sha, "subject": subject, "body": body.strip(),
             "issue_numbers": extract_issue_numbers(subject + "\n" + body),
             "files": files,
             "test_files": [path for path in files if "test" in Path(path).name.lower()],
@@ -369,27 +386,13 @@ def commit_records(repo: Path, base_tag: str, release_tag: str,
     return records
 
 
-def diff_tokens(text: str) -> set[str]:
-    """Extract useful words for conservative note/commit matching."""
-    stop = {"about", "after", "also", "because", "before", "being", "calls", "changes",
-            "does", "from", "have", "into", "more", "only", "other", "that", "their",
-            "then", "there", "these", "this", "through", "under", "using", "were", "what",
-            "when", "where", "which", "with", "would", "your", "now", "new", "used"}
-    return {word for word in re.findall(r"[a-z][a-z0-9_]{3,}", text.lower()) if word not in stop}
-
-
-def matching_commits(note: dict[str, Any], commits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Match note to commits by linked issue, or substantial term overlap."""
+def matching_commits(note: dict[str, Any], commits: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    """Only link implementation evidence through exact issue-ID matches."""
     issues = set(note.get("issue_numbers", []))
-    note_terms = diff_tokens(note["text"])
-    matches = []
-    for commit in commits:
-        if issues.intersection(commit["issue_numbers"]):
-            matches.append(commit)
-            continue
-        if len(note_terms & diff_tokens(commit["subject"] + " " + commit["body"])) >= 3:
-            matches.append(commit)
-    return matches[:10]
+    if not issues:
+        return []
+    matches = [commit for commit in commits if issues.intersection(commit["issue_numbers"])]
+    return matches[:limit]
 
 
 def note_evidence(note: dict[str, Any], notes_url: str) -> dict[str, Any]:
@@ -398,69 +401,102 @@ def note_evidence(note: dict[str, Any], notes_url: str) -> dict[str, Any]:
 
 
 def feature_key(text: str) -> tuple[str, str] | None:
+    # Match the most specific clear feature first; min/max and clear can appear
+    # in the same list block in older/flattened notes, so return all keys below.
     for key, title, pattern in LANGUAGE_FEATURES:
         if pattern.search(text):
             return key, title
     return None
 
 
+def feature_keys(text: str) -> list[tuple[str, str]]:
+    return [(key, title) for key, title, pattern in LANGUAGE_FEATURES if pattern.search(text)]
+
+
+def normalized_heading(heading: str) -> str:
+    return HEADING_ID_RE.sub("", heading.strip()).strip()
+
+
 def package_for_heading(heading: str) -> str | None:
     """Map a package section heading to its source-tree path."""
-    candidate = heading.strip().lower()
-    if candidate.startswith("new ") or candidate in {"overview", "introduction to go", "tools", "go command", "cgo", "compiler", "assembler", "linker", "runtime", "standard library", "changes to the language"}:
+    candidate = normalized_heading(heading).lower()
+    if candidate.startswith("new ") or candidate in {
+        "overview", "introduction to go", "tools", "go command", "cgo",
+        "compiler", "assembler", "linker", "runtime", "standard library",
+        "changes to the language", "darwin", "windows", "arm", "webassembly",
+        "webassembly system interface", "ppc64/ppc64le", "loong64",
+    }:
         return None
-    # Release note headings can be Markdown links such as [archive/tar](/pkg/...).
-    candidate = markdown_text(candidate)
     if re.fullmatch(r"[a-z0-9_./-]+", candidate):
         return f"src/{candidate}/"
     return None
 
 
-def release_note_changes(notes: dict[str, Any], parser_commits: list[dict[str, Any]],
-                         all_commits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group language topics and release-note behavior/deprecation candidates."""
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    for note in notes["sections"]:
-        heading = note["heading"].strip()
-        text = note["text"].strip()
-        evidence = note_evidence(note, notes["url"])
-        issue_ids = set(note.get("issue_numbers", []))
-
-        language_heading = heading.lower().startswith("changes to the language")
-        feature = feature_key(text) if language_heading else None
-        if feature:
-            key, title = feature
-            relevant = matching_commits(note, parser_commits)
-            category = "language_feature" if relevant else "language_feature_candidate"
-            record_key = (category, key)
-            group = grouped.setdefault(record_key, {
-                "category": category, "title": title, "parts": [], "evidence": [],
-                "issue_numbers": set(),
-                "status": "evidence_linked" if relevant else "review_required",
-                "confidence": "high" if relevant else "candidate",
-            })
-            group["parts"].append(text)
-            group["evidence"].append(evidence)
-            group["issue_numbers"].update(issue_ids)
-            group["evidence"].extend({
-                "type": "parser_typechecker_commit", "url": commit["url"],
-                "commit": commit["commit"], "subject": commit["subject"],
-                "files": commit["files"], "test_files": commit["test_files"],
-            } for commit in relevant)
+def _is_api_addition_note(note: dict[str, Any], api_changes: list[dict[str, Any]]) -> bool:
+    """Avoid relabeling API inventory additions as behavior changes."""
+    issues = set(note.get("issue_numbers", []))
+    if not issues:
+        return False
+    for change in api_changes:
+        if change["category"] not in {"public_api_addition", "deprecation"}:
             continue
+        if issues.intersection(change.get("issue_numbers", [])):
+            return True
+    return False
+
+
+def release_note_changes(notes: dict[str, Any], parser_commits: list[dict[str, Any]],
+                         all_commits: list[dict[str, Any]],
+                         api_changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group language topics and focused release-note behavior/deprecation items."""
+    language_groups: dict[str, dict[str, Any]] = {}
+    note_groups: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+
+    for note in notes["sections"]:
+        heading = normalized_heading(note["heading"])
+        text = note["text"].strip()
+        issue_ids = set(note.get("issue_numbers", []))
+        evidence = note_evidence(note, notes["url"])
+        language_heading = heading.lower().startswith("changes to the language")
+
+        if language_heading:
+            for key, title in feature_keys(text):
+                group = language_groups.setdefault(key, {
+                    "category": "language_feature_candidate", "title": title,
+                    "parts": [], "evidence": [], "issue_numbers": set(),
+                    "matched": False,
+                })
+                relevant = matching_commits(note, parser_commits)
+                group["matched"] = group["matched"] or bool(relevant)
+                group["parts"].append(text)
+                group["evidence"].append(evidence)
+                group["issue_numbers"].update(issue_ids)
+                group["evidence"].extend({
+                    "type": "parser_typechecker_commit", "url": commit["url"],
+                    "commit": commit["commit"], "subject": commit["subject"],
+                    "files": commit["files"], "test_files": commit["test_files"],
+                } for commit in relevant)
 
         category = "deprecation" if DEPRECATION_RE.search(text) else None
         if category is None and BEHAVIOR_SIGNALS.search(text):
             category = "behavior_change_candidate"
-        if category is None:
+        if category is None or _is_api_addition_note(note, api_changes):
+            continue
+
+        # A release-note deprecation already represented by a deprecated API
+        # inventory entry should not be duplicated, but keep unmatched notes.
+        if category == "deprecation" and _is_api_addition_note(note, api_changes):
             continue
 
         package_path = package_for_heading(heading)
         candidates = [commit for commit in all_commits if package_path and
                       any(path.startswith(package_path) for path in commit["files"])]
         relevant = matching_commits(note, candidates)
-        record_key = (category, heading.lower())
-        group = grouped.setdefault(record_key, {
+        # Keep distinct issue-backed changes separate, rather than combining all
+        # notes under a broad heading (for example several unrelated os changes).
+        identity = tuple(sorted(issue_ids)) or (text,)
+        group_key = (category, heading.lower(), identity)
+        group = note_groups.setdefault(group_key, {
             "category": category, "title": heading, "parts": [], "evidence": [],
             "issue_numbers": set(), "status": "review_required", "confidence": "candidate",
         })
@@ -474,7 +510,16 @@ def release_note_changes(notes: dict[str, Any], parser_commits: list[dict[str, A
         } for commit in relevant)
 
     results = []
-    for group in grouped.values():
+    for key, group in language_groups.items():
+        matched = group.pop("matched")
+        group["category"] = "language_feature" if matched else "language_feature_candidate"
+        group["status"] = "evidence_linked" if matched else "review_required"
+        group["confidence"] = "high" if matched else "candidate"
+        group["summary"] = " ".join(dict.fromkeys(group.pop("parts")))
+        group["evidence"] = unique_evidence(group["evidence"])
+        group["issue_numbers"] = sorted(group["issue_numbers"])
+        results.append(group)
+    for group in note_groups.values():
         group["summary"] = " ".join(dict.fromkeys(group.pop("parts")))
         group["evidence"] = unique_evidence(group["evidence"])
         group["issue_numbers"] = sorted(group["issue_numbers"])
@@ -546,7 +591,7 @@ def main() -> int:
         parser_commits = commit_records(repo, base_tag, release_tag, PARSER_TYPECHECK_PATHS)
         all_commits = commit_records(repo, base_tag, release_tag, ("src/",))
         changes = api_change_records(repo, base_tag, release_tag, previous_minor, target_minor)
-        changes.extend(release_note_changes(notes, parser_commits, all_commits))
+        changes.extend(release_note_changes(notes, parser_commits, all_commits, changes))
         changes = unique_changes(changes)
 
         counts: dict[str, int] = {}
@@ -554,7 +599,7 @@ def main() -> int:
             counts[change["category"]] = counts.get(change["category"], 0) + 1
 
         output = {
-            "schema_version": 6,
+            "schema_version": 7,
             "language": "Go", "version": version,
             "previous_version": previous_version,
             "base_tag": base_tag, "release_tag": release_tag,
@@ -575,13 +620,13 @@ def main() -> int:
                 "api_additions": "New target-release inventory entries grouped by package and proposal issue.",
                 "api_removals": "Cumulative inventory difference filtered through api/except.txt; remaining entries are review candidates.",
                 "deprecations": "Target API //deprecated markers and explicit release-note deprecation notices.",
-                "language_features": "Only the requested language topics are extracted; parser/type-checker evidence is issue-linked when available.",
-                "behavior_changes": "Explicit observable behavior statements from release notes; records remain review_required and include related implementation/test evidence when identified.",
+                "language_features": "Only requested language topics are extracted; parser/type-checker implementation commits are linked only by exact issue ID.",
+                "behavior_changes": "Explicit observable behavior statements from release notes; new API additions are not duplicated as behavior changes, and implementation evidence is linked only by exact issue ID.",
                 "limitations": [
                     "Go release-note source is golang/website/_content/doc/go1.X.md, not the golang/go repository or rendered go.dev HTML.",
-                    "Unmatched commit evidence is omitted rather than weakly associated.",
+                    "Markdown parsing is block-oriented; unsupported formatting may require review.",
+                    "Maintenance-branch commits with an explicit release-branch prefix are excluded from implementation evidence.",
                     "API removal records are candidates and require compatibility-policy review.",
-                    "This output excludes maintenance-branch patch history.",
                 ],
             },
         }
