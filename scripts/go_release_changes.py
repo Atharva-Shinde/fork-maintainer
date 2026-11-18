@@ -36,8 +36,6 @@ PARSER_TYPECHECK_PATHS = (
 )
 HIDDEN_TAGS = {"nav", "header", "footer", "script", "style", "noscript"}
 
-# Keep behavior extraction conservative: these describe an observable change,
-# not merely a new API or an implementation/performance improvement.
 BEHAVIOR_SIGNALS = re.compile(
     r"\b(no longer|previously|instead of|now returns?|now requires?|"
     r"now behaves?|behavior has changed|behaviour has changed|"
@@ -48,9 +46,7 @@ DEPRECATION_RE = re.compile(
     r"\b(deprecat\w*|discouraged|should not be used)\b", re.IGNORECASE
 )
 
-# Go 1.21 language claims requested for the initial focused extraction. The
-# patterns intentionally match the feature itself, not every paragraph under
-# the broad "Changes to the language" heading.
+# Only these explicit language-feature topics are emitted as language changes.
 LANGUAGE_FEATURES = (
     ("builtin-min-max", "Built-in min and max", re.compile(r"\bmin\b.*\bmax\b", re.I)),
     ("builtin-clear", "Built-in clear", re.compile(r"\bclear\b.*\b(map|slice)\b", re.I)),
@@ -105,7 +101,7 @@ def extract_issue_numbers(text: str) -> list[str]:
 
 
 class ReleaseNotesParser(HTMLParser):
-    """Read only the release-note article and ignore site chrome and footer."""
+    """Parse article content only, skipping navigation, footer, and scripts."""
     BLOCK_TAGS = {"p", "li", "pre", "blockquote"}
 
     def __init__(self, version: str) -> None:
