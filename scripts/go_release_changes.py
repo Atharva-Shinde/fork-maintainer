@@ -46,7 +46,6 @@ DEPRECATION_RE = re.compile(
     r"\b(deprecat\w*|discouraged|should not be used)\b", re.IGNORECASE
 )
 
-# Only these explicit language-feature topics are emitted as language changes.
 LANGUAGE_FEATURES = (
     ("builtin-min-max", "Built-in min and max", re.compile(r"\bmin\b.*\bmax\b", re.I)),
     ("builtin-clear", "Built-in clear", re.compile(r"\bclear\b.*\b(map|slice)\b", re.I)),
@@ -101,14 +100,15 @@ def extract_issue_numbers(text: str) -> list[str]:
 
 
 class ReleaseNotesParser(HTMLParser):
-    """Parse article content only, skipping navigation, footer, and scripts."""
+    """Parse the release article and keep headings with their block text."""
     BLOCK_TAGS = {"p", "li", "pre", "blockquote"}
 
     def __init__(self, version: str) -> None:
         super().__init__(convert_charrefs=True)
         self.version = version
         self.hidden_depth = 0
-        self.article_started = False
+        self.article_depth = 0
+        self.in_article = False
         self.heading = ""
         self.heading_level = 0
         self.heading_parts: list[str] = []
@@ -120,11 +120,22 @@ class ReleaseNotesParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
+        class_value = attr_map.get("class", "") or ""
+        element_id = attr_map.get("id", "") or ""
+
         if tag in HIDDEN_TAGS:
             self.hidden_depth += 1
             return
         if self.hidden_depth:
             return
+
+        # go.dev release pages use <main id="page"> around the article.
+        # Restricting to the main/article region prevents site chrome/footer noise.
+        if tag in {"main", "article"}:
+            self.article_depth += 1
+            if element_id == "page" or tag == "article":
+                self.in_article = True
+
         if re.fullmatch(r"h[1-6]", tag):
             self.heading_level = int(tag[1])
             self.heading_parts = []
@@ -154,17 +165,20 @@ class ReleaseNotesParser(HTMLParser):
             return
         if self.hidden_depth:
             return
+
         if re.fullmatch(r"h[1-6]", tag) and self.heading_level:
             title = " ".join("".join(self.heading_parts).split())
-            self.heading = title
-            if re.search(rf"\bgo\s*{re.escape(self.version)}\b", title, re.I):
-                self.article_started = True
+            if title:
+                self.heading = title
             self.heading_level = 0
         elif self.block_tag is not None and tag in self.BLOCK_TAGS:
             self.block_depth -= 1
             if self.block_depth <= 0:
                 text = " ".join("".join(self.block_parts).split())
-                if text and self.article_started and self.heading:
+                if text and self.heading:
+                    # Only accept content once the release article has started.
+                    # If no release heading is represented by the HTML,
+                    # retain content from the main/article region instead.
                     self.sections.append({
                         "heading": self.heading,
                         "text": text,
@@ -174,6 +188,10 @@ class ReleaseNotesParser(HTMLParser):
                 self.block_tag = None
                 self.block_parts = []
                 self.block_links = []
+        elif tag in {"main", "article"} and self.article_depth:
+            self.article_depth -= 1
+            if self.article_depth == 0:
+                self.in_article = False
 
 
 def parse_markdown_notes(content: str, version: str) -> list[dict[str, Any]]:
@@ -206,8 +224,10 @@ def parse_markdown_notes(content: str, version: str) -> list[dict[str, Any]]:
 
 
 def get_release_notes(repo: Path, tag: str, version: str) -> dict[str, Any]:
-    """Read tagged notes first; fetch the official page only as a fallback."""
+    """Read tagged notes first; fetch the official page only as fallback."""
     url = f"https://go.dev/doc/go{version}"
+
+    # Prefer the HTML/Markdown release document at the target tag.
     for path in (f"doc/go{version}.html", f"doc/go{version}.md"):
         content = git_file(repo, tag, path)
         if content is None:
@@ -218,20 +238,39 @@ def get_release_notes(repo: Path, tag: str, version: str) -> dict[str, Any]:
             sections = parser.sections
         else:
             sections = parse_markdown_notes(content, version)
-        return {"source": "repository", "path": path,
-                "url": f"https://github.com/golang/go/blob/{tag}/{path}",
-                "sections": sections}
+        if sections:
+            return {"source": "repository", "path": path,
+                    "url": f"https://github.com/golang/go/blob/{tag}/{path}",
+                    "sections": sections}
+
+    # Go's _content directory is another tagged source for release docs.
+    for path in (f"_content/doc/go{version}.html", f"_content/doc/go{version}.md"):
+        content = git_file(repo, tag, path)
+        if content is None:
+            continue
+        if path.endswith(".html"):
+            parser = ReleaseNotesParser(version)
+            parser.feed(content)
+            sections = parser.sections
+        else:
+            sections = parse_markdown_notes(content, version)
+        if sections:
+            return {"source": "repository", "path": path,
+                    "url": f"https://github.com/golang/go/blob/{tag}/{path}",
+                    "sections": sections}
 
     try:
         request = Request(url, headers={"User-Agent": "go-release-change-extractor/1.0"})
         with urlopen(request, timeout=20) as response:
             content = response.read().decode("utf-8", errors="replace")
+
         parser = ReleaseNotesParser(version)
         parser.feed(content)
-        if not parser.sections:
-            raise RuntimeError("could not find the release-note article in the downloaded page")
+        sections = parser.sections
+        if not sections:
+            raise RuntimeError("could not find release-note article blocks in the downloaded page")
         return {"source": "go.dev", "path": None, "url": url,
-                "sections": parser.sections}
+                "sections": sections}
     except (OSError, URLError, RuntimeError) as exc:
         return {"source": "unavailable", "path": None, "url": url,
                 "sections": [], "error": str(exc)}
@@ -554,7 +593,7 @@ def main() -> int:
             counts[change["category"]] = counts.get(change["category"], 0) + 1
 
         output = {
-            "schema_version": 4,
+            "schema_version": 5,
             "language": "Go",
             "version": version,
             "previous_version": previous_version,
