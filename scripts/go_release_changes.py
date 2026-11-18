@@ -148,7 +148,6 @@ def tag_key(tag: str) -> tuple[int, ...]:
 
 
 def available_tags(repo: Path, version: str, branch: str) -> list[str]:
-    # Include the historical version-only initial tag as well as .0-style tags.
     pattern = re.compile(rf"go{re.escape(version)}(?:\.\d+)?$")
     tags = [t for t in git(repo, "tag", "--list", f"go{version}*").splitlines()
             if pattern.fullmatch(t)]
@@ -236,6 +235,101 @@ def api_changes(repo: Path, previous: str, target: str, previous_version: str,
     return changes
 
 
+def build_changes(version: str, release_tag: str, api_entries: list[dict[str, Any]],
+                  release_history: list[dict[str, Any]],
+                  patch_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a stable, normalized change catalog from authoritative and candidate evidence."""
+    normalized: list[dict[str, Any]] = []
+
+    for entry in api_entries:
+        category = entry["category"]
+        if category == "api_added":
+            normalized_category = "public_api_addition"
+            title = "Public API added"
+        elif category == "api_deprecated":
+            normalized_category = "deprecation"
+            title = "Public API deprecated"
+        else:
+            normalized_category = "potential_api_removal"
+            title = "Public API removal candidate"
+
+        normalized.append({
+            "id": f"api-{len(normalized) + 1:04d}",
+            "category": normalized_category,
+            "title": title,
+            "summary": entry["declaration"],
+            "migration": [],
+            "severity": "unknown" if category == "api_removed_candidate" else "low",
+            "confidence": entry["confidence"],
+            "status": "review_required" if category == "api_removed_candidate" else "evidence_extracted",
+            "affected_packages": [],
+            "affected_code_patterns": [],
+            "issue_numbers": entry["issue_numbers"],
+            "sources": entry["sources"],
+        })
+
+    for record in release_history:
+        labels = record["candidate_labels"]
+        if "general_change" in labels and len(labels) == 1:
+            continue
+
+        category = "security_candidate" if "security_candidate" in labels else \
+                   "compatibility_review_candidate" if "compatibility_review_candidate" in labels else \
+                   "feature_candidate"
+        normalized.append({
+            "id": f"commit-{record['commit'][:12]}",
+            "category": category,
+            "title": record["subject"],
+            "summary": "",
+            "migration": [],
+            "severity": "unknown",
+            "confidence": "candidate",
+            "status": "needs_review",
+            "affected_packages": [],
+            "affected_code_patterns": [],
+            "issue_numbers": record["issue_numbers"],
+            "sources": record["sources"],
+            "provenance": {
+                "stage": record["stage"],
+                "commit": record["commit"],
+                "files": record["files"],
+            },
+        })
+
+    for record in patch_history:
+        labels = record["candidate_labels"]
+        if "security_candidate" in labels:
+            category = "security_patch_candidate"
+        elif "compatibility_review_candidate" in labels:
+            category = "compatibility_patch_candidate"
+        elif "feature_candidate" in labels:
+            category = "feature_patch_candidate"
+        else:
+            continue
+
+        normalized.append({
+            "id": f"commit-{record['commit'][:12]}",
+            "category": category,
+            "title": record["subject"],
+            "summary": "",
+            "migration": [],
+            "severity": "unknown",
+            "confidence": "candidate",
+            "status": "needs_review",
+            "affected_packages": [],
+            "affected_code_patterns": [],
+            "issue_numbers": record["issue_numbers"],
+            "sources": record["sources"],
+            "provenance": {
+                "stage": record["stage"],
+                "commit": record["commit"],
+                "files": record["files"],
+            },
+        })
+
+    return normalized
+
+
 def parse_version(value: str) -> tuple[int, int]:
     match = re.fullmatch(r"(?:go)?(\d+)\.(\d+)", value)
     if not match:
@@ -261,13 +355,22 @@ def main() -> int:
         git(repo, "rev-parse", "--git-dir")
         base_tag = resolve_release_tag(repo, previous_version)
         release_tag = resolve_release_tag(repo, version)
-        if not ref_exists(repo, branch):
+
+        if branch.startswith("origin/"):
+            branch_ref = branch
+            branch_name = branch.removeprefix("origin/")
+        else:
+            branch_ref = branch
+            branch_name = branch
+
+        if not ref_exists(repo, branch_ref):
             raise RuntimeError(
-                f"cannot resolve branch/ref {branch!r}; fetch it or pass the local ref name with --branch"
+                f"cannot resolve branch/ref {branch_ref!r}; fetch it or pass the local ref name with --branch"
             )
-        patch_tags = available_tags(repo, version, branch)
+
+        patch_tags = available_tags(repo, version, branch_ref)
         if release_tag not in patch_tags:
-            raise RuntimeError(f"{release_tag} is not reachable from {branch}; fetch tags/branch first")
+            raise RuntimeError(f"{release_tag} is not reachable from {branch_ref}; fetch tags/branch first")
 
         changes = api_changes(repo, base_tag, release_tag, previous_version, version)
         notes = release_notes(repo, release_tag, version)
@@ -280,17 +383,19 @@ def main() -> int:
                 continue
             patch_history.extend(commit_records(repo, previous, tag, version, f"patch:{tag}"))
             previous = tag
-        if git(repo, "rev-parse", branch) != git(repo, "rev-parse", previous):
-            patch_history.extend(commit_records(repo, previous, branch, version, "patch:branch-tip"))
+        if git(repo, "rev-parse", branch_ref) != git(repo, "rev-parse", previous):
+            patch_history.extend(commit_records(repo, previous, branch_ref, version, "patch:branch-tip"))
+
+        normalized_changes = build_changes(version, release_tag, changes, history, patch_history)
 
         output = {
-            "schema_version": 1,
+            "schema_version": 2,
             "language": "Go",
             "version": version,
             "previous_version": previous_version,
             "base_tag": base_tag,
             "release_tag": release_tag,
-            "maintenance_branch": branch,
+            "maintenance_branch": branch_name,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "methodology": {
                 "release_range": f"{base_tag}..{release_tag}",
@@ -300,13 +405,16 @@ def main() -> int:
                     "API inventory does not capture language or behavioral changes; review release notes and commits.",
                     "An API removal candidate can be caused by inventory format or baseline differences; verify manually.",
                     "Patch branch history may include backports and should not be treated as new minor-version features.",
+                    "The changes array separates extracted facts from needs-review candidates, but does not replace human curation.",
                 ],
             },
             "release_notes": notes,
+            "changes": normalized_changes,
             "api_changes": changes,
             "release_commits": history,
             "patch_commits": patch_history,
             "summary": {
+                "normalized_changes": len(normalized_changes),
                 "api_added": sum(c["category"] == "api_added" for c in changes),
                 "api_deprecated": sum(c["category"] == "api_deprecated" for c in changes),
                 "api_removed_candidates": sum(c["category"] == "api_removed_candidate" for c in changes),
@@ -317,7 +425,7 @@ def main() -> int:
             "sources": {
                 "base_tag": f"https://github.com/golang/go/tree/{base_tag}",
                 "release_tag": f"https://github.com/golang/go/tree/{release_tag}",
-                "maintenance_branch": f"https://github.com/golang/go/tree/{branch}",
+                "maintenance_branch": f"https://github.com/golang/go/tree/{branch_name}",
                 "release_notes": notes["url"],
             },
         }
