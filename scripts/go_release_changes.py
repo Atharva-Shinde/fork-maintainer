@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import html
 from html.parser import HTMLParser
 import json
 import re
@@ -29,6 +28,29 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
     if check and proc.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def ref_exists(repo: Path, ref: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def resolve_release_tag(repo: Path, version: str) -> str:
+    """Resolve Go's initial release tag, accepting both historical tag styles.
+
+    Go tags have not always used the same spelling for the initial point
+    release: repositories may have go1.20 or go1.21.0. Patch tags normally
+    continue as go1.20.1, go1.20.2, etc.
+    """
+    for candidate in (f"go{version}.0", f"go{version}"):
+        if ref_exists(repo, f"refs/tags/{candidate}"):
+            return candidate
+    raise RuntimeError(
+        f"cannot find initial release tag for Go {version}; looked for "
+        f"go{version}.0 and go{version}. Fetch tags with `git fetch --tags origin`."
+    )
 
 
 def exists(repo: Path, revision: str, path: str) -> bool:
@@ -129,11 +151,12 @@ def tag_key(tag: str) -> tuple[int, ...]:
 
 
 def available_tags(repo: Path, version: str, branch: str) -> list[str]:
-    prefix = f"go{version}."
-    tags = [t for t in git(repo, "tag", "--list", f"{prefix}*").splitlines()
-            if re.fullmatch(re.escape(prefix) + r"\d+", t)]
+    # Include the historical version-only initial tag as well as .0-style tags.
+    pattern = re.compile(rf"go{re.escape(version)}(?:\.\d+)?$")
+    tags = [t for t in git(repo, "tag", "--list", f"go{version}*").splitlines()
+            if pattern.fullmatch(t)]
     reachable = []
-    for tag in sorted(tags, key=tag_key):
+    for tag in sorted(tags, key=lambda value: (tag_key(value), value)):
         result = subprocess.run(
             ["git", "-C", str(repo), "merge-base", "--is-ancestor", tag, branch],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -205,7 +228,6 @@ def api_changes(repo: Path, previous: str, target: str, previous_version: str,
                     f"https://github.com/golang/go/blob/{target}/api/go{version}.txt",
                 ],
             })
-    # A deprecation may remain in both inventories and therefore not appear in the diff.
     for declaration in sorted(new):
         if "//deprecated" in declaration.lower() and declaration in old:
             changes.append({
@@ -237,12 +259,15 @@ def main() -> int:
     version = f"{major}.{minor}"
     branch = args.branch or f"release-branch.go{version}"
     previous_version = f"{major}.{minor - 1}"
-    base_tag, release_tag = f"go{previous_version}.0", f"go{version}.0"
 
     try:
         git(repo, "rev-parse", "--git-dir")
-        for ref in (base_tag, release_tag, branch):
-            git(repo, "rev-parse", "--verify", ref)
+        base_tag = resolve_release_tag(repo, previous_version)
+        release_tag = resolve_release_tag(repo, version)
+        if not ref_exists(repo, branch):
+            raise RuntimeError(
+                f"cannot resolve branch/ref {branch!r}; fetch it or pass the local ref name with --branch"
+            )
         patch_tags = available_tags(repo, version, branch)
         if release_tag not in patch_tags:
             raise RuntimeError(f"{release_tag} is not reachable from {branch}; fetch tags/branch first")
@@ -251,7 +276,6 @@ def main() -> int:
         notes = release_notes(repo, release_tag, version)
         history = commit_records(repo, base_tag, release_tag, version, "release")
 
-        # Attribute maintenance commits to each successive patch tag; include any branch-tip delta.
         previous = release_tag
         patch_history = []
         for tag in patch_tags:
@@ -267,12 +291,13 @@ def main() -> int:
             "language": "Go",
             "version": version,
             "previous_version": previous_version,
+            "base_tag": base_tag,
             "release_tag": release_tag,
             "maintenance_branch": branch,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "methodology": {
                 "release_range": f"{base_tag}..{release_tag}",
-                "patch_ranges": "successive reachable goX.Y.Z tags, then latest tag to branch tip",
+                "patch_ranges": "successive reachable goX.Y[.Z] tags, then latest tag to branch tip",
                 "limitations": [
                     "Commit labels are heuristic candidates, not authoritative classifications.",
                     "API inventory does not capture language or behavioral changes; review release notes and commits.",
@@ -293,6 +318,7 @@ def main() -> int:
                 "release_note_sections": len(notes["sections"]),
             },
             "sources": {
+                "base_tag": f"https://github.com/golang/go/tree/{base_tag}",
                 "release_tag": f"https://github.com/golang/go/tree/{release_tag}",
                 "maintenance_branch": f"https://github.com/golang/go/tree/{branch}",
                 "release_notes": notes["url"],
