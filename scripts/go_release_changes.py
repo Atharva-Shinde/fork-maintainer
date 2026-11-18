@@ -38,18 +38,18 @@ def ref_exists(repo: Path, ref: str) -> bool:
 
 
 def resolve_release_tag(repo: Path, version: str) -> str:
-    """Resolve Go's initial release tag, accepting both historical tag styles.
+    """Resolve initial-release tags using Go's historical naming convention.
 
-    Go tags have not always used the same spelling for the initial point
-    release: repositories may have go1.20 or go1.21.0. Patch tags normally
-    continue as go1.20.1, go1.20.2, etc.
+    Go 1.20 and earlier use goX.Y for the initial release. Go 1.21 and later
+    use goX.Y.0. Patch releases retain their .Z suffix in either era.
     """
-    for candidate in (f"go{version}.0", f"go{version}"):
-        if ref_exists(repo, f"refs/tags/{candidate}"):
-            return candidate
+    major, minor = (int(part) for part in version.split("."))
+    candidate = f"go{version}" if (major, minor) <= (1, 20) else f"go{version}.0"
+    if ref_exists(repo, f"refs/tags/{candidate}"):
+        return candidate
     raise RuntimeError(
-        f"cannot find initial release tag for Go {version}; looked for "
-        f"go{version}.0 and go{version}. Fetch tags with `git fetch --tags origin`."
+        f"cannot find initial release tag for Go {version}; expected {candidate}. "
+        "Fetch tags with `git fetch --tags origin`."
     )
 
 
