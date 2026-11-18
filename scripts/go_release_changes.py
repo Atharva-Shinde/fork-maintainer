@@ -35,6 +35,7 @@ PARSER_TYPECHECK_PATHS = (
     "src/cmd/compile/internal/syntax/", "src/cmd/compile/internal/types2/",
 )
 HIDDEN_TAGS = {"nav", "header", "footer", "script", "style", "noscript"}
+
 # Keep behavior extraction conservative: these describe an observable change,
 # not merely a new API or an implementation/performance improvement.
 BEHAVIOR_SIGNALS = re.compile(
@@ -46,6 +47,7 @@ BEHAVIOR_SIGNALS = re.compile(
 DEPRECATION_RE = re.compile(
     r"\b(deprecat\w*|discouraged|should not be used)\b", re.IGNORECASE
 )
+
 # Go 1.21 language claims requested for the initial focused extraction. The
 # patterns intentionally match the feature itself, not every paragraph under
 # the broad "Changes to the language" heading.
@@ -109,7 +111,6 @@ class ReleaseNotesParser(HTMLParser):
     def __init__(self, version: str) -> None:
         super().__init__(convert_charrefs=True)
         self.version = version
-        self.main_depth = 0
         self.hidden_depth = 0
         self.article_started = False
         self.heading = ""
@@ -126,8 +127,6 @@ class ReleaseNotesParser(HTMLParser):
         if tag in HIDDEN_TAGS:
             self.hidden_depth += 1
             return
-        if tag == "main":
-            self.main_depth += 1
         if self.hidden_depth:
             return
         if re.fullmatch(r"h[1-6]", tag):
@@ -162,13 +161,9 @@ class ReleaseNotesParser(HTMLParser):
         if re.fullmatch(r"h[1-6]", tag) and self.heading_level:
             title = " ".join("".join(self.heading_parts).split())
             self.heading = title
-            # The first release-specific heading starts the article. This also
-            # makes parsing resilient when a site template has no <main> tag.
             if re.search(rf"\bgo\s*{re.escape(self.version)}\b", title, re.I):
                 self.article_started = True
             self.heading_level = 0
-        elif tag == "main" and self.main_depth:
-            self.main_depth -= 1
         elif self.block_tag is not None and tag in self.BLOCK_TAGS:
             self.block_depth -= 1
             if self.block_depth <= 0:
@@ -178,9 +173,7 @@ class ReleaseNotesParser(HTMLParser):
                         "heading": self.heading,
                         "text": text,
                         "links": list(dict.fromkeys(self.block_links)),
-                        "issue_numbers": extract_issue_numbers(
-                            text + " " + " ".join(self.block_links)
-                        ),
+                        "issue_numbers": extract_issue_numbers(text + " " + " ".join(self.block_links)),
                     })
                 self.block_tag = None
                 self.block_parts = []
@@ -300,8 +293,6 @@ def grouped_api_records(declarations: set[str], category: str, url: str,
     for declaration in declarations:
         package = api_package(declaration)
         issues = extract_issue_numbers(declaration)
-        # An issue is the proposal-level key; use the canonical declaration
-        # where inventories do not carry a proposal issue number.
         keys = issues or [canonical_api_declaration(declaration)]
         for issue in keys:
             grouped.setdefault((package, issue), []).append(declaration)
@@ -344,14 +335,11 @@ def api_change_records(repo: Path, base_tag: str, release_tag: str,
     changes.extend(grouped_api_records(additions, "public_api_addition", new_url))
     changes.extend(grouped_api_records(deprecated, "deprecation", new_url))
 
-    # API inventories are intended to be cumulative. Filter Go's explicit
-    # compatibility exceptions before exposing remaining differences.
     allowed_removals = except_entries(repo, release_tag)
     removal_candidates = (old_api - new_api) - allowed_removals
     changes.extend(grouped_api_records(
         removal_candidates, "api_removal_candidate", old_url, "review_required"
     ))
-    # Attach the target inventory as comparative evidence to each removal group.
     for change in changes:
         if change["category"] == "api_removal_candidate":
             change["evidence"].append({"type": "api_inventory", "url": new_url})
@@ -452,9 +440,6 @@ def release_note_changes(notes: dict[str, Any], parser_commits: list[dict[str, A
         if feature:
             key, title = feature
             relevant = matching_commits(note, parser_commits)
-            # Some release notes (notably Go language changes) contain no issue
-            # IDs. Keep the note as a reviewable candidate unless code evidence
-            # can be linked by parser/type-checker paths and related terms.
             category = "language_feature" if relevant else "language_feature_candidate"
             record_key = (category, key)
             group = grouped.setdefault(record_key, {
@@ -501,7 +486,6 @@ def release_note_changes(notes: dict[str, Any], parser_commits: list[dict[str, A
 
     results = []
     for group in grouped.values():
-        # Deduplicate repeated paragraphs and evidence while preserving order.
         group["summary"] = " ".join(dict.fromkeys(group.pop("parts")))
         group["evidence"] = unique_evidence(group["evidence"])
         group["issue_numbers"] = sorted(group["issue_numbers"])
@@ -529,7 +513,7 @@ def unique_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if key not in unique:
             unique[key] = change
     ordered = sorted(unique.values(), key=lambda item: (
-        item["category"], item["title""], item["summary"]
+        item["category"], item["title"], item["summary"]
     ))
     for index, change in enumerate(ordered, 1):
         change["id"] = f"change-{index:04d}"
